@@ -1,5 +1,6 @@
 # Ignore all JSON and DB files
 *.json
+*.jsonl
 *.db
 
 # Byte-compiled / optimized / DLL files

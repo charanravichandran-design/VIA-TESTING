@@ -3,12 +3,14 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"math/rand"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -16,6 +18,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	gocb "github.com/couchbase/gocb/v2"
 	"gopkg.in/ini.v1"
 )
@@ -38,19 +44,28 @@ type Config struct {
 	GroundTruthPath  string
 	DataPath         string
 
+	// [s3] (optional, used when dataset paths are s3:// URIs)
+	S3Region          string
+	S3Profile         string
+	S3Endpoint        string
+	S3AccessKeyID     string
+	S3SecretAccessKey string
+	S3SessionToken    string
+	S3UsePathStyle    bool
+
 	// [index]
 	IndexType   string
 	IndexName   string
 	VectorField string
 
 	// [index_creation]
-	Dimension          int
-	Similarity         string
-	Description        string
-	NList              int
-	TrainList          int
-	NumReplica         int
-	PersistFullVector  bool
+	Dimension         int
+	Similarity        string
+	Description       string
+	NList             int
+	TrainList         int
+	NumReplica        int
+	PersistFullVector bool
 
 	// [query]
 	TopK      int
@@ -95,6 +110,15 @@ func loadConfig(path string) (*Config, error) {
 	c.QueryVectorsPath = ds.Key("query_vectors_path").String()
 	c.GroundTruthPath = ds.Key("ground_truth_path").String()
 	c.DataPath = ds.Key("data_path").String()
+
+	s3 := f.Section("s3")
+	c.S3Region = s3.Key("region").MustString("")
+	c.S3Profile = s3.Key("profile").MustString("")
+	c.S3Endpoint = s3.Key("endpoint").MustString("")
+	c.S3AccessKeyID = s3.Key("access_key_id").MustString("")
+	c.S3SecretAccessKey = s3.Key("secret_access_key").MustString("")
+	c.S3SessionToken = s3.Key("session_token").MustString("")
+	c.S3UsePathStyle = s3.Key("use_path_style").MustBool(false)
 
 	idx := f.Section("index")
 	c.IndexType = idx.Key("index_type").MustString("hyperscale")
@@ -147,21 +171,21 @@ func parseFlags(c *Config) {
 	// The actual value was already read in main() before INI was loaded.
 	flag.String("config", "config.ini", "Path to config.ini")
 
-	nlist        := flag.Int("nlist",               c.NList,       "Number of IVF centroids")
-	trainList    := flag.Int("train-list",           c.TrainList,   "Training set size for codebook")
-	quantization := flag.String("quantization",      "",            "Quantization suffix e.g. SQ8, SQ4")
-	persistFV    := flag.String("persist-full-vector", "",          "Store full vector: true|false")
-	nprobes      := flag.Int("nprobes",              c.NProbes,     "nProbes per query")
-	reranking    := flag.String("reranking",         "",            "Enable reranking: true|false")
-	topNScan     := flag.Int("top-n-scan",           c.TopNScan,    "topNScan (0 = default)")
-	workers      := flag.Int("workers",              c.Workers,     "Concurrent query workers")
-	warmup       := flag.Int("warmup",               c.Warmup,      "Warmup duration in seconds")
-	duration     := flag.Int("duration",             c.Duration,    "Measurement duration in seconds")
-	topK         := flag.Int("top-k",                c.TopK,        "K for KNN retrieval")
-	skipLoad     := flag.String("skip-load",         "",            "Skip data load: true|false")
-	skipIndex    := flag.String("skip-index",        "",            "Skip index build: true|false")
-	loadWorkers  := flag.Int("load-workers",         c.LoadWorkers, "Concurrent data load workers")
-	output       := flag.String("output",            c.OutputJSON,  "Output JSON path")
+	nlist := flag.Int("nlist", c.NList, "Number of IVF centroids")
+	trainList := flag.Int("train-list", c.TrainList, "Training set size for codebook")
+	quantization := flag.String("quantization", "", "Quantization suffix e.g. SQ8, SQ4")
+	persistFV := flag.String("persist-full-vector", "", "Store full vector: true|false")
+	nprobes := flag.Int("nprobes", c.NProbes, "nProbes per query")
+	reranking := flag.String("reranking", "", "Enable reranking: true|false")
+	topNScan := flag.Int("top-n-scan", c.TopNScan, "topNScan (0 = default)")
+	workers := flag.Int("workers", c.Workers, "Concurrent query workers")
+	warmup := flag.Int("warmup", c.Warmup, "Warmup duration in seconds")
+	duration := flag.Int("duration", c.Duration, "Measurement duration in seconds")
+	topK := flag.Int("top-k", c.TopK, "K for KNN retrieval")
+	skipLoad := flag.String("skip-load", "", "Skip data load: true|false")
+	skipIndex := flag.String("skip-index", "", "Skip index build: true|false")
+	loadWorkers := flag.Int("load-workers", c.LoadWorkers, "Concurrent data load workers")
+	output := flag.String("output", c.OutputJSON, "Output JSON path")
 	flag.Parse()
 
 	c.NList = *nlist
@@ -208,27 +232,177 @@ func parseFlags(c *Config) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// §3  .fvecs / .ivecs binary readers
+// §3  Dataset source abstraction + .fvecs / .ivecs readers
 // ─────────────────────────────────────────────────────────────────────────────
 
-func loadFvecs(path string) ([][]float32, error) {
-	f, err := os.Open(path)
+type datasetOpener struct {
+	cfg      *Config
+	mu       sync.Mutex
+	s3Client *s3.S3
+}
+
+func newDatasetOpener(c *Config) *datasetOpener {
+	return &datasetOpener{cfg: c}
+}
+
+func isS3Path(path string) bool {
+	return strings.HasPrefix(strings.ToLower(path), "s3://")
+}
+
+func parseS3URI(raw string) (bucket, key string, err error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid S3 URI %q: %w", raw, err)
+	}
+	if u.Scheme != "s3" {
+		return "", "", fmt.Errorf("invalid S3 URI scheme for %q", raw)
+	}
+	if u.Host == "" {
+		return "", "", fmt.Errorf("missing bucket in S3 URI %q", raw)
+	}
+	key = strings.TrimPrefix(u.Path, "/")
+	if key == "" {
+		return "", "", fmt.Errorf("missing object key in S3 URI %q", raw)
+	}
+	return u.Host, key, nil
+}
+
+func (o *datasetOpener) getS3Client() (*s3.S3, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.s3Client != nil {
+		return o.s3Client, nil
+	}
+
+	region := o.cfg.S3Region
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	awsCfg := aws.NewConfig().
+		WithRegion(region).
+		WithS3ForcePathStyle(o.cfg.S3UsePathStyle)
+	if o.cfg.S3Endpoint != "" {
+		awsCfg = awsCfg.WithEndpoint(o.cfg.S3Endpoint)
+	}
+	if o.cfg.S3AccessKeyID != "" && o.cfg.S3SecretAccessKey != "" {
+		awsCfg = awsCfg.WithCredentials(credentials.NewStaticCredentials(
+			o.cfg.S3AccessKeyID,
+			o.cfg.S3SecretAccessKey,
+			o.cfg.S3SessionToken,
+		))
+	}
+
+	sessOpts := session.Options{
+		Config:            *awsCfg,
+		SharedConfigState: session.SharedConfigEnable,
+	}
+	if o.cfg.S3Profile != "" {
+		sessOpts.Profile = o.cfg.S3Profile
+	}
+
+	sess, err := session.NewSessionWithOptions(sessOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AWS session: %w", err)
+	}
+
+	client := s3.New(sess, awsCfg)
+
+	o.s3Client = client
+	return client, nil
+}
+
+func (o *datasetOpener) Open(path string) (io.ReadCloser, error) {
+	if !isS3Path(path) {
+		return os.Open(path)
+	}
+
+	bucket, key, err := parseS3URI(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	client, err := o.getS3Client()
+	if err != nil {
+		return nil, err
+	}
+	out, err := client.GetObject(&s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("s3 get object %s: %w", path, err)
+	}
+	return out.Body, nil
+}
+
+func readFvec(r io.Reader) ([]float32, error) {
+	var dim int32
+	if err := binary.Read(r, binary.LittleEndian, &dim); err != nil {
+		return nil, err
+	}
+	if dim <= 0 {
+		return nil, fmt.Errorf("invalid fvec dimension: %d", dim)
+	}
+	vec := make([]float32, int(dim))
+	if err := binary.Read(r, binary.LittleEndian, vec); err != nil {
+		return nil, err
+	}
+	return vec, nil
+}
+
+func readIvec(r io.Reader) ([]int32, error) {
+	var dim int32
+	if err := binary.Read(r, binary.LittleEndian, &dim); err != nil {
+		return nil, err
+	}
+	if dim <= 0 {
+		return nil, fmt.Errorf("invalid ivec dimension: %d", dim)
+	}
+	vec := make([]int32, int(dim))
+	if err := binary.Read(r, binary.LittleEndian, vec); err != nil {
+		return nil, err
+	}
+	return vec, nil
+}
+
+func streamFvecs(path string, opener *datasetOpener, emit func(idx int, vec []float32) error) (int, error) {
+	r, err := opener.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer r.Close()
+
+	count := 0
+	for {
+		vec, err := readFvec(r)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return count, err
+		}
+		if err := emit(count, vec); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+func loadFvecs(path string, opener *datasetOpener) ([][]float32, error) {
+	r, err := opener.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
 
 	var vecs [][]float32
 	for {
-		var dim int32
-		if err := binary.Read(f, binary.LittleEndian, &dim); err != nil {
-			if err == io.EOF {
+		vec, err := readFvec(r)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
 				break
 			}
-			return nil, err
-		}
-		vec := make([]float32, dim)
-		if err := binary.Read(f, binary.LittleEndian, vec); err != nil {
 			return nil, err
 		}
 		vecs = append(vecs, vec)
@@ -236,24 +410,20 @@ func loadFvecs(path string) ([][]float32, error) {
 	return vecs, nil
 }
 
-func loadIvecs(path string) ([][]int32, error) {
-	f, err := os.Open(path)
+func loadIvecs(path string, opener *datasetOpener) ([][]int32, error) {
+	r, err := opener.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer r.Close()
 
 	var vecs [][]int32
 	for {
-		var dim int32
-		if err := binary.Read(f, binary.LittleEndian, &dim); err != nil {
-			if err == io.EOF {
+		vec, err := readIvec(r)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
 				break
 			}
-			return nil, err
-		}
-		vec := make([]int32, dim)
-		if err := binary.Read(f, binary.LittleEndian, vec); err != nil {
 			return nil, err
 		}
 		vecs = append(vecs, vec)
@@ -384,7 +554,7 @@ func createIndex(cluster *gocb.Cluster, c *Config) (float64, error) {
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
-func loadData(cluster *gocb.Cluster, c *Config, vecs [][]float32) {
+func loadData(cluster *gocb.Cluster, c *Config, opener *datasetOpener) error {
 	col := cluster.Bucket(c.Bucket).Scope(c.Scope).Collection(c.Collection)
 
 	type Doc struct {
@@ -407,7 +577,7 @@ func loadData(cluster *gocb.Cluster, c *Config, vecs [][]float32) {
 		batchSize = 1
 	}
 
-	log.Printf("Loading %d vectors (%d workers, batch=%d) ...", len(vecs), loadWorkers, batchSize)
+	log.Printf("Loading vectors from %s (%d workers, batch=%d) ...", c.DataPath, loadWorkers, batchSize)
 	t0 := time.Now()
 
 	jobs := make(chan docItem, loadWorkers*batchSize)
@@ -450,23 +620,29 @@ func loadData(cluster *gocb.Cluster, c *Config, vecs [][]float32) {
 		go worker()
 	}
 
-	for i, vec := range vecs {
+	enqueued, streamErr := streamFvecs(c.DataPath, opener, func(i int, vec []float32) error {
 		jobs <- docItem{
 			id:  fmt.Sprintf("%s-%d", c.DocIDPrefix, i),
 			vec: vec,
 		}
 		if (i+1)%10000 == 0 {
-			log.Printf("  Enqueued %d/%d documents ...", i+1, len(vecs))
+			log.Printf("  Enqueued %d documents ...", i+1)
 		}
-	}
+		return nil
+	})
 	close(jobs)
 	wg.Wait()
+	if streamErr != nil {
+		return fmt.Errorf("failed while streaming base vectors: %w", streamErr)
+	}
 
-	log.Printf("Data load complete: %d ok, %d errors in %.1fs",
+	log.Printf("Data load complete: %d enqueued, %d ok, %d errors in %.1fs",
+		enqueued,
 		atomic.LoadInt64(&successCount),
 		atomic.LoadInt64(&errCount),
 		time.Since(t0).Seconds(),
 	)
+	return nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -582,15 +758,15 @@ func runPhase(cluster *gocb.Cluster, c *Config, stmt string, queryVecs [][]float
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Metrics struct {
-	TotalQueries     int     `json:"total_queries"`
-	SuccessfulQueries int    `json:"successful_queries"`
-	FailedQueries    int     `json:"failed_queries"`
-	ThroughputQPS    float64 `json:"throughput_qps"`
-	LatencyAvgMs     float64 `json:"latency_avg_ms"`
-	LatencyP95Ms     float64 `json:"latency_p95_ms"`
-	LatencyP99Ms     float64 `json:"latency_p99_ms"`
-	RecallAt10       float64 `json:"recall_at_10"`
-	IndexBuildTimeS  float64 `json:"index_build_time_s,omitempty"`
+	TotalQueries      int     `json:"total_queries"`
+	SuccessfulQueries int     `json:"successful_queries"`
+	FailedQueries     int     `json:"failed_queries"`
+	ThroughputQPS     float64 `json:"throughput_qps"`
+	LatencyAvgMs      float64 `json:"latency_avg_ms"`
+	LatencyP95Ms      float64 `json:"latency_p95_ms"`
+	LatencyP99Ms      float64 `json:"latency_p99_ms"`
+	RecallAt10        float64 `json:"recall_at_10"`
+	IndexBuildTimeS   float64 `json:"index_build_time_s,omitempty"`
 }
 
 func computeMetrics(results []queryResult, groundTruth [][]int32, topK int, wallSecs float64, docIDPrefix string) Metrics {
@@ -600,7 +776,7 @@ func computeMetrics(results []queryResult, groundTruth [][]int32, topK int, wall
 
 	latencies := make([]float64, len(results))
 	var totalLat, recallSum float64
-	prefixFmt := docIDPrefix + "-%d"  // e.g. "vec-%d"
+	prefixFmt := docIDPrefix + "-%d" // e.g. "vec-%d"
 
 	for i, r := range results {
 		ms := float64(r.latency.Microseconds()) / 1000.0
@@ -638,13 +814,13 @@ func computeMetrics(results []queryResult, groundTruth [][]int32, topK int, wall
 	p99idx := int(math.Min(float64(n-1), math.Ceil(0.99*float64(n))-1))
 
 	return Metrics{
-		TotalQueries:     n,
+		TotalQueries:      n,
 		SuccessfulQueries: n,
-		ThroughputQPS:    float64(n) / wallSecs,
-		LatencyAvgMs:     totalLat / float64(n),
-		LatencyP95Ms:     latencies[p95idx],
-		LatencyP99Ms:     latencies[p99idx],
-		RecallAt10:       recallSum / float64(n),
+		ThroughputQPS:     float64(n) / wallSecs,
+		LatencyAvgMs:      totalLat / float64(n),
+		LatencyP95Ms:      latencies[p95idx],
+		LatencyP99Ms:      latencies[p99idx],
+		RecallAt10:        recallSum / float64(n),
 	}
 }
 
@@ -674,6 +850,7 @@ func main() {
 
 	log.Printf("index=%s  nprobes=%d  reranking=%v  topNScan=%d  workers=%d",
 		c.Description, c.NProbes, c.Reranking, c.TopNScan, c.Workers)
+	opener := newDatasetOpener(c)
 
 	// Step 4: Connect to Couchbase
 	cluster, err := connectCB(c)
@@ -684,11 +861,9 @@ func main() {
 	// Step 5: Load data (parallel goroutines — no Python GIL limitation here)
 	if !c.SkipLoad {
 		log.Printf("Loading base vectors from %s ...", c.DataPath)
-		vecs, err := loadFvecs(c.DataPath)
-		if err != nil {
+		if err := loadData(cluster, c, opener); err != nil {
 			log.Fatalf("Failed to load base vectors: %v", err)
 		}
-		loadData(cluster, c, vecs)
 	}
 
 	// Step 6: Build index
@@ -701,11 +876,11 @@ func main() {
 	}
 
 	// Step 7: Load query vectors and ground truth into RAM
-	queryVecs, err := loadFvecs(c.QueryVectorsPath)
+	queryVecs, err := loadFvecs(c.QueryVectorsPath, opener)
 	if err != nil {
 		log.Fatalf("Failed to load query vectors: %v", err)
 	}
-	groundTruth, err := loadIvecs(c.GroundTruthPath)
+	groundTruth, err := loadIvecs(c.GroundTruthPath, opener)
 	if err != nil {
 		log.Fatalf("Failed to load ground truth: %v", err)
 	}

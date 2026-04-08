@@ -3,6 +3,7 @@ module vector_bench
 go 1.21
 
 require (
+	github.com/aws/aws-sdk-go v1.55.8
 	github.com/couchbase/gocb/v2 v2.7.1
 	gopkg.in/ini.v1 v1.67.0
 )
@@ -16,6 +17,7 @@ require (
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/uuid v1.5.0 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0 // indirect
+	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.26.0 // indirect
 	golang.org/x/net v0.20.0 // indirect
