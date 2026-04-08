@@ -50,5 +50,8 @@ coverage.xml
 # VS Code settings
 .vscode/
 
+# Job output
+job_runs/
+
 # MacOS
 .DS_Store
