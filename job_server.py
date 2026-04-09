@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import asyncio
 import configparser
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -14,7 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -25,6 +28,8 @@ app = FastAPI(title="VIA Benchmark Job Server", version="0.1.0")
 
 jobs_lock = threading.Lock()
 jobs: dict[str, dict[str, Any]] = {}
+subscribers_lock = threading.Lock()
+job_subscribers: dict[str, list[queue.Queue[str]]] = {}
 
 ALLOWED_OVERRIDE_SECTIONS = {
     "connection",
@@ -33,12 +38,54 @@ ALLOWED_OVERRIDE_SECTIONS = {
     "optuna",
     "index_params",
     "query_params",
+    "loading",
+    "benchmark",
 }
 FORBIDDEN_OPTUNA_KEYS = {"n_index_trials", "n_query_trials"}
+TERMINAL_JOB_STATES = {"completed", "failed", "cancelled"}
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def sse_event(event: str, data: str) -> str:
+    lines = data.splitlines() or [""]
+    body = "".join(f"data: {line}\n" for line in lines)
+    return f"event: {event}\n{body}\n"
+
+
+def subscribe_logs(job_id: str) -> queue.Queue[str]:
+    q: queue.Queue[str] = queue.Queue(maxsize=1000)
+    with subscribers_lock:
+        job_subscribers.setdefault(job_id, []).append(q)
+    return q
+
+
+def unsubscribe_logs(job_id: str, q: queue.Queue[str]) -> None:
+    with subscribers_lock:
+        subs = job_subscribers.get(job_id, [])
+        if q in subs:
+            subs.remove(q)
+        if not subs and job_id in job_subscribers:
+            del job_subscribers[job_id]
+
+
+def publish_log_line(job_id: str, line: str) -> None:
+    with subscribers_lock:
+        targets = list(job_subscribers.get(job_id, []))
+    for q in targets:
+        try:
+            q.put_nowait(line)
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(line)
+            except queue.Full:
+                pass
 
 
 def to_ini_value(value: Any) -> str:
@@ -185,7 +232,9 @@ def run_job(job_id: str, cmd: list[str], log_path: Path, artifacts: dict[str, st
     proc: Optional[subprocess.Popen[str]] = None
 
     with log_path.open("a", encoding="utf-8", buffering=1) as logf:
-        logf.write(f"[{utc_now()}] Starting job: {' '.join(cmd)}\n")
+        start_line = f"[{utc_now()}] Starting job: {' '.join(cmd)}"
+        logf.write(start_line + "\n")
+        publish_log_line(job_id, start_line)
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -209,6 +258,7 @@ def run_job(job_id: str, cmd: list[str], log_path: Path, artifacts: dict[str, st
         assert proc.stdout is not None
         for line in proc.stdout:
             logf.write(line)
+            publish_log_line(job_id, line.rstrip("\n"))
             print(f"[job {job_id}] {line}", end="")
 
         rc = proc.wait()
@@ -235,6 +285,7 @@ def run_job(job_id: str, cmd: list[str], log_path: Path, artifacts: dict[str, st
         summary=summary,
         error=None if rc == 0 else f"Process exited with code {rc}",
     )
+    publish_log_line(job_id, f"[{utc_now()}] Job finished with status={status} code={rc}")
 
 
 def get_job_or_404(job_id: str) -> dict[str, Any]:
@@ -248,6 +299,75 @@ def get_job_or_404(job_id: str) -> dict[str, Any]:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/ui/jobs/{job_id}", response_class=HTMLResponse)
+def job_log_page(job_id: str) -> str:
+    get_job_or_404(job_id)
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Job {job_id} Logs</title>
+  <style>
+    body {{ font-family: ui-monospace, Menlo, monospace; margin: 0; background: #0f1115; color: #e6edf3; }}
+    header {{ padding: 12px 16px; border-bottom: 1px solid #2a2f3a; display: flex; gap: 16px; align-items: center; }}
+    .status {{ padding: 2px 8px; border-radius: 999px; background: #273244; }}
+    .container {{ padding: 12px 16px; }}
+    pre {{ white-space: pre-wrap; word-break: break-word; margin: 0; line-height: 1.3; }}
+  </style>
+</head>
+<body>
+  <header>
+    <div>Job: <b>{job_id}</b></div>
+    <div>Status: <span id="status" class="status">loading...</span></div>
+  </header>
+  <div class="container">
+    <pre id="logs"></pre>
+  </div>
+  <script>
+    const jobId = {json.dumps(job_id)};
+    const logEl = document.getElementById('logs');
+    const statusEl = document.getElementById('status');
+
+    async function refreshStatus() {{
+      const r = await fetch(`/jobs/${{jobId}}`);
+      const j = await r.json();
+      statusEl.textContent = j.status;
+    }}
+
+    function appendLine(line) {{
+      logEl.textContent += line + "\\n";
+      window.scrollTo(0, document.body.scrollHeight);
+    }}
+
+    async function loadInitial() {{
+      const r = await fetch(`/jobs/${{jobId}}/logs?limit=300`);
+      const j = await r.json();
+      statusEl.textContent = j.status;
+      for (const line of j.lines) appendLine(line);
+    }}
+
+    async function main() {{
+      await loadInitial();
+      const es = new EventSource(`/jobs/${{jobId}}/logs/stream`);
+      es.addEventListener('log', (ev) => appendLine(ev.data));
+      es.addEventListener('status', (ev) => {{
+        statusEl.textContent = ev.data;
+        if (ev.data === 'completed' || ev.data === 'failed' || ev.data === 'cancelled') {{
+          es.close();
+        }}
+      }});
+      es.onerror = () => {{
+        setTimeout(() => window.location.reload(), 3000);
+      }};
+      setInterval(refreshStatus, 3000);
+    }}
+    main();
+  </script>
+</body>
+</html>"""
 
 
 @app.post("/jobs")
@@ -318,6 +438,33 @@ def get_job_logs(job_id: str, limit: int = Query(default=200, ge=1, le=5000)) ->
         "status": job["status"],
         "lines": read_tail(log_path, limit),
     }
+
+
+@app.get("/jobs/{job_id}/logs/stream")
+async def stream_job_logs(job_id: str, request: Request) -> StreamingResponse:
+    get_job_or_404(job_id)
+    q = subscribe_logs(job_id)
+
+    async def event_generator():
+        yield "retry: 2000\n\n"
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    line = await asyncio.to_thread(q.get, True, 1.0)
+                    yield sse_event("log", line)
+                except queue.Empty:
+                    job = get_job_or_404(job_id)
+                    if job["status"] in TERMINAL_JOB_STATES:
+                        yield sse_event("status", job["status"])
+                        break
+                    yield ": keep-alive\n\n"
+        finally:
+            unsubscribe_logs(job_id, q)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.post("/jobs/{job_id}/cancel")
