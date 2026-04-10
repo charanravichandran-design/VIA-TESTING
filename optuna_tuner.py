@@ -48,6 +48,7 @@ import argparse
 import configparser
 import json
 import logging
+import math
 import subprocess
 import sys
 import threading
@@ -271,6 +272,15 @@ def main() -> None:
     tns_max      = cfg.getint("query_params", "top_n_scan_max",  fallback=500)
     tns_step     = cfg.getint("query_params", "top_n_scan_step", fallback=50)
 
+    # ── Baseline values from config.ini for first-run seeding ───────────────
+    base_nlist = cfg.getint("index_creation", "nlist", fallback=nlist_min)
+    base_train_list = cfg.getint("index_creation", "train_list", fallback=tl_min)
+    base_description = cfg.get("index_creation", "description", fallback="")
+    base_persist_full_vector = cfg.getboolean("index_creation", "persist_full_vector", fallback=True)
+    base_nprobes = cfg.getint("query", "nprobes", fallback=nprobes_min)
+    base_reranking = cfg.getboolean("query", "reranking", fallback=False)
+    base_top_n_scan = cfg.getint("query", "top_n_scan", fallback=0)
+
     # ── Output paths ──────────────────────────────────────────────────────────
     trial_log      = cfg.get("tuner_output", "trial_log",      fallback="trial_results.jsonl")
     pareto_report  = cfg.get("tuner_output", "pareto_report",  fallback="pareto_report.json")
@@ -293,6 +303,75 @@ def main() -> None:
     log.info(f"Objectives      : {list(zip(objectives, directions))}")
     log.info("=" * 60)
 
+    def is_valid_step(value: int, min_v: int, step: int) -> bool:
+        if step <= 0:
+            return False
+        return ((value - min_v) % step) == 0
+
+    def normalize_range_and_step(min_v: int, max_v: int, step: int, baseline: int, label: str) -> tuple[int, int, int]:
+        new_min = min(min_v, baseline)
+        new_max = max(max_v, baseline)
+        new_step = step
+        if new_step <= 0:
+            new_step = 1
+        if not is_valid_step(baseline, new_min, new_step):
+            gap = abs(baseline - new_min)
+            new_step = math.gcd(new_step, gap) or 1
+            log.warning(
+                "Adjusted %s step to %d so baseline value %d is exactly representable.",
+                label,
+                new_step,
+                baseline,
+            )
+        if new_min != min_v or new_max != max_v:
+            log.warning(
+                "Expanded %s range from [%d, %d] to [%d, %d] to include baseline value %d.",
+                label, min_v, max_v, new_min, new_max, baseline,
+            )
+        return new_min, new_max, new_step
+
+    def parse_quantization_from_description(description: str) -> Optional[str]:
+        parts = [p.strip() for p in description.split(",") if p.strip()]
+        if len(parts) < 2:
+            return None
+        return parts[1]
+
+    nlist_min, nlist_max, nlist_step = normalize_range_and_step(
+        nlist_min, nlist_max, nlist_step, base_nlist, "nlist",
+    )
+    tl_min, tl_max, tl_step = normalize_range_and_step(
+        tl_min, tl_max, tl_step, base_train_list, "train_list",
+    )
+    nprobes_min, nprobes_max, effective_nprobes_step = normalize_range_and_step(
+        nprobes_min, nprobes_max, nprobes_step, base_nprobes, "nprobes",
+    )
+    tns_min, tns_max, effective_tns_step = normalize_range_and_step(
+        tns_min, tns_max, tns_step, base_top_n_scan, "top_n_scan",
+    )
+
+    seeded_outer_params: Optional[dict] = None
+    seeded_quantization = parse_quantization_from_description(base_description)
+    if seeded_quantization and seeded_quantization not in quant_choices:
+        quant_choices.append(seeded_quantization)
+        log.warning("Added baseline quantization '%s' to search choices.", seeded_quantization)
+    if base_persist_full_vector not in persist_choices:
+        persist_choices.append(base_persist_full_vector)
+        log.warning("Added baseline persist_full_vector=%s to search choices.", base_persist_full_vector)
+
+    candidate_quant = seeded_quantization if seeded_quantization else (quant_choices[0] if quant_choices else None)
+    if candidate_quant is not None:
+        seeded_outer_params = {
+            "nlist": base_nlist,
+            "train_list": base_train_list,
+            "quantization": candidate_quant,
+            "persist_full_vector": base_persist_full_vector,
+        }
+        log.info(f"Seeding first outer trial from config [index_creation]: {seeded_outer_params}")
+        if candidate_quant != seeded_quantization:
+            log.warning("Baseline description had no quantization suffix; using '%s' for seed.", candidate_quant)
+    else:
+        log.warning("Skipping outer trial seed from [index_creation] due missing quantization choices.")
+
     # ── Outer Optuna study  (index build-time parameters) ────────────────────
     #
     #   Suggests: nlist, train_list, quantization, persist_full_vector
@@ -307,8 +386,12 @@ def main() -> None:
         storage        = f"sqlite:///{optuna_storage}",
         load_if_exists = args.resume,
     )
+    if seeded_outer_params is not None:
+        outer_study.enqueue_trial(seeded_outer_params)
+    seed_inner_consumed = False
 
     def outer_objective(trial: optuna.Trial) -> tuple:
+        nonlocal seed_inner_consumed
         # ── Suggest index build params ────────────────────────────────────────
         nlist               = trial.suggest_int("nlist",      nlist_min, nlist_max, step=nlist_step)
         train_list          = trial.suggest_int("train_list", tl_min,    tl_max,    step=tl_step)
@@ -330,17 +413,40 @@ def main() -> None:
         #   Each inner trial calls the Go binary with skip-index=true
         #   so no rebuild happens. Only query params change.
         #
+        is_seeded_outer_trial = (
+            seeded_outer_params is not None
+            and nlist == seeded_outer_params["nlist"]
+            and train_list == seeded_outer_params["train_list"]
+            and quantization == seeded_outer_params["quantization"]
+            and persist_full_vector == seeded_outer_params["persist_full_vector"]
+        )
+
         inner_study = optuna.create_study(
             directions = directions,
             sampler    = TPESampler(multivariate=True),
         )
+        if (
+            is_seeded_outer_trial
+            and not seed_inner_consumed
+        ):
+            np_max = min(nprobes_max, nlist)
+            seeded_nprobes = max(nprobes_min, min(np_max, base_nprobes))
+            seeded_inner = {
+                "nprobes": seeded_nprobes,
+                "reranking": base_reranking if persist_full_vector else False,
+            }
+            if seeded_inner["reranking"]:
+                seeded_inner["top_n_scan"] = max(tns_min, min(tns_max, base_top_n_scan))
+            log.info(f"Seeding first inner trial from config [query]: {seeded_inner}")
+            inner_study.enqueue_trial(seeded_inner)
+            seed_inner_consumed = True
         inner_results: list = []
 
         def inner_objective(inner_trial: optuna.Trial) -> tuple:
             nonlocal data_loaded, index_built, built_this_outer
             # Cap nprobes to nlist — critical constraint
             np_max   = min(nprobes_max, nlist)
-            nprobes  = inner_trial.suggest_int("nprobes", nprobes_min, np_max, step=nprobes_step)
+            nprobes  = inner_trial.suggest_int("nprobes", nprobes_min, np_max, step=effective_nprobes_step)
 
             # reranking only makes sense when persist_full_vector=True
             reranking = (
@@ -350,7 +456,7 @@ def main() -> None:
 
             # top_n_scan only makes sense when reranking=True
             top_n_scan = (
-                inner_trial.suggest_int("top_n_scan", tns_min, tns_max, step=tns_step)
+                inner_trial.suggest_int("top_n_scan", tns_min, tns_max, step=effective_tns_step)
                 if reranking else 0
             )
 

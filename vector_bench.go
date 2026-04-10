@@ -288,9 +288,12 @@ func parseFlags(c *Config) bool {
 	if *reranking != "" {
 		c.Reranking = strings.ToLower(*reranking) == "true"
 	}
-	// Enforce persist_full_vector -> reranking coupling
-	// If persist_full_vector=true then reranking=true, else both false.
-	c.Reranking = c.PersistFullVector
+	// Reranking requires full-vector persistence, but full-vector persistence
+	// does not force reranking on.
+	if c.Reranking && !c.PersistFullVector {
+		log.Printf("reranking requested but persist_full_vector=false; forcing reranking=false")
+		c.Reranking = false
+	}
 	if !c.Reranking {
 		c.TopNScan = 0
 	}
