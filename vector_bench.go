@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -54,9 +55,12 @@ type Config struct {
 	S3UsePathStyle    bool
 
 	// [index]
-	IndexType   string
-	IndexName   string
-	VectorField string
+	IndexType     string
+	IndexName     string
+	VectorField   string
+	ScalarFields  []string
+	IncludeFields []string
+	IndexWhere    string
 
 	// [index_creation]
 	Dimension         int
@@ -68,10 +72,12 @@ type Config struct {
 	PersistFullVector bool
 
 	// [query]
-	TopK      int
-	NProbes   int
-	Reranking bool
-	TopNScan  int
+	TopK        int
+	NProbes     int
+	Reranking   bool
+	TopNScan    int
+	WhereClause string
+	NamedParams map[string]interface{}
 
 	// [benchmark]
 	Workers      int
@@ -80,11 +86,14 @@ type Config struct {
 	QueryTimeout time.Duration
 
 	// [loading]
-	SkipLoad    bool
-	SkipIndex   bool
-	BatchSize   int
-	LoadWorkers int
-	DocIDPrefix string
+	SkipLoad     bool
+	SkipIndex    bool
+	BatchSize    int
+	LoadWorkers  int
+	DocIDPrefix  string
+	StaticFields map[string]interface{}
+	ScalarField  string
+	ScalarModulo int
 
 	// [output]
 	OutputJSON string
@@ -121,9 +130,12 @@ func loadConfig(path string) (*Config, error) {
 	c.S3UsePathStyle = s3.Key("use_path_style").MustBool(false)
 
 	idx := f.Section("index")
-	c.IndexType = idx.Key("index_type").MustString("hyperscale")
+	c.IndexType = normalizeIndexType(idx.Key("index_type").MustString("hyperscale"))
 	c.IndexName = idx.Key("index_name").MustString("vec_bench_idx")
 	c.VectorField = idx.Key("vector_field").MustString("vec")
+	c.ScalarFields = parseCSVList(idx.Key("scalar_fields").MustString(""))
+	c.IncludeFields = parseCSVList(idx.Key("include_fields").MustString(""))
+	c.IndexWhere = idx.Key("where_clause").MustString("")
 
 	ic := f.Section("index_creation")
 	c.Dimension = ic.Key("dimension").MustInt(128)
@@ -139,6 +151,15 @@ func loadConfig(path string) (*Config, error) {
 	c.NProbes = q.Key("nprobes").MustInt(1)
 	c.Reranking = q.Key("reranking").MustBool(false)
 	c.TopNScan = q.Key("top_n_scan").MustInt(0)
+	c.WhereClause = q.Key("where_clause").MustString("")
+	c.NamedParams = map[string]interface{}{}
+	if raw := q.Key("named_params_json").MustString(""); raw != "" {
+		params, err := parseJSONMap(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid [query].named_params_json: %w", err)
+		}
+		c.NamedParams = params
+	}
 
 	b := f.Section("benchmark")
 	c.Workers = b.Key("workers").MustInt(16)
@@ -152,11 +173,61 @@ func loadConfig(path string) (*Config, error) {
 	c.BatchSize = l.Key("load_batch_size").MustInt(500)
 	c.LoadWorkers = l.Key("load_workers").MustInt(c.Workers)
 	c.DocIDPrefix = l.Key("doc_id_prefix").MustString("vec")
+	c.StaticFields = map[string]interface{}{}
+	if raw := l.Key("static_fields_json").MustString(""); raw != "" {
+		fields, err := parseJSONMap(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid [loading].static_fields_json: %w", err)
+		}
+		c.StaticFields = fields
+	}
+	c.ScalarField = l.Key("scalar_field").MustString("")
+	c.ScalarModulo = l.Key("scalar_modulo").MustInt(0)
 
 	o := f.Section("output")
 	c.OutputJSON = o.Key("output_json").MustString("results.json")
 
 	return c, nil
+}
+
+func parseJSONMap(raw string) (map[string]interface{}, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return map[string]interface{}{}, nil
+	}
+	out := map[string]interface{}{}
+	if err := json.Unmarshal([]byte(trimmed), &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func parseCSVList(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func normalizeIndexType(raw string) string {
+	return strings.ToLower(strings.TrimSpace(raw))
+}
+
+func isHyperscaleIndexType(indexType string) bool {
+	return normalizeIndexType(indexType) == "hyperscale"
+}
+
+func isCompositeIndexType(indexType string) bool {
+	return normalizeIndexType(indexType) == "composite"
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -166,7 +237,7 @@ func loadConfig(path string) (*Config, error) {
 //	Flags passed on the command line override the INI value.
 //
 // ─────────────────────────────────────────────────────────────────────────────
-func parseFlags(c *Config) {
+func parseFlags(c *Config) bool {
 	// Register -config so flag.Parse() doesn't reject it.
 	// The actual value was already read in main() before INI was loaded.
 	flag.String("config", "config.ini", "Path to config.ini")
@@ -186,6 +257,7 @@ func parseFlags(c *Config) {
 	skipIndex := flag.String("skip-index", "", "Skip index build: true|false")
 	loadWorkers := flag.Int("load-workers", c.LoadWorkers, "Concurrent data load workers")
 	output := flag.String("output", c.OutputJSON, "Output JSON path")
+	dropIndexOnly := flag.Bool("drop-index-only", false, "Drop configured index and exit")
 	flag.Parse()
 
 	c.NList = *nlist
@@ -216,10 +288,9 @@ func parseFlags(c *Config) {
 	if *reranking != "" {
 		c.Reranking = strings.ToLower(*reranking) == "true"
 	}
-	// Enforce constraints
-	if !c.PersistFullVector {
-		c.Reranking = false
-	}
+	// Enforce persist_full_vector -> reranking coupling
+	// If persist_full_vector=true then reranking=true, else both false.
+	c.Reranking = c.PersistFullVector
 	if !c.Reranking {
 		c.TopNScan = 0
 	}
@@ -229,6 +300,7 @@ func parseFlags(c *Config) {
 	if *skipIndex != "" {
 		c.SkipIndex = strings.ToLower(*skipIndex) == "true"
 	}
+	return *dropIndexOnly
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -487,23 +559,40 @@ func createIndex(cluster *gocb.Cluster, c *Config) (float64, error) {
 
 	// Build WITH clause
 	with := fmt.Sprintf(
-		`{"dimension":%d,"similarity":"%s","description":"%s","train_list":%d}`,
-		c.Dimension, c.Similarity, c.Description, c.TrainList,
+		`{"dimension":%d,"similarity":"%s","description":"%s","train_list":%d,"persist_full_vector":%t}`,
+		c.Dimension, c.Similarity, c.Description, c.TrainList, c.PersistFullVector,
 	)
+	vectorKey := fmt.Sprintf("%s VECTOR", formatFieldExpr(c.VectorField))
+	partitionKeys := formatFieldExprList(c.ScalarFields)
+	includeKeys := formatFieldExprList(c.IncludeFields)
+	whereClause := strings.TrimSpace(c.IndexWhere)
+	indexType := normalizeIndexType(c.IndexType)
+	isHyperscale := false
 
 	// Build DDL
 	var ddl string
-	if c.IndexType == "hyperscale" {
-		ddl = fmt.Sprintf(
-			"CREATE VECTOR INDEX `%s`\n  ON %s (`%s` VECTOR)\n  WITH %s",
-			c.IndexName, ks, c.VectorField, with,
-		)
-	} else {
-		ddl = fmt.Sprintf(
-			"CREATE INDEX `%s`\n  ON %s (`%s` VECTOR)\n  USING GSI WITH %s",
-			c.IndexName, ks, c.VectorField, with,
-		)
+	switch {
+	case isHyperscaleIndexType(indexType):
+		isHyperscale = true
+		keys := append([]string{}, partitionKeys...)
+		keys = append(keys, vectorKey)
+		ddl = fmt.Sprintf("CREATE VECTOR INDEX `%s`\n  ON %s (%s)", c.IndexName, ks, strings.Join(keys, ", "))
+	case isCompositeIndexType(indexType):
+		compositeKeys := append([]string{}, partitionKeys...)
+		compositeKeys = append(compositeKeys, vectorKey)
+		ddl = fmt.Sprintf("CREATE INDEX `%s`\n  ON %s (%s)\n  ", c.IndexName, ks, strings.Join(compositeKeys, ", "))
+	default:
+		return 0, fmt.Errorf("unsupported index_type %q (supported: hyperscale, composite)", c.IndexType)
 	}
+	if whereClause != "" {
+		ddl += fmt.Sprintf("\n  WHERE %s", whereClause)
+	}
+	if len(includeKeys) > 0 && isHyperscale {
+		ddl += fmt.Sprintf("\n  INCLUDE (%s)", strings.Join(includeKeys, ", "))
+	} else if len(includeKeys) > 0 {
+		log.Printf("Ignoring include_fields for index_type=%s (INCLUDE is hyperscale-only).", c.IndexType)
+	}
+	ddl += fmt.Sprintf("\n  WITH %s", with)
 	log.Printf("Creating index:\n%s", ddl)
 
 	t0 := time.Now()
@@ -546,6 +635,62 @@ func createIndex(cluster *gocb.Cluster, c *Config) (float64, error) {
 	return buildTime, nil
 }
 
+func dropIndex(cluster *gocb.Cluster, c *Config) error {
+	ks := fmt.Sprintf("`%s`.`%s`.`%s`", c.Bucket, c.Scope, c.Collection)
+	log.Printf("Dropping index '%s' ...", c.IndexName)
+	_, err := mgmtQuery(cluster, fmt.Sprintf("DROP INDEX `%s` IF EXISTS ON %s;", c.IndexName, ks), 60*time.Second)
+	return err
+}
+
+func isSimpleIdentifier(field string) bool {
+	if field == "" {
+		return false
+	}
+	for i, r := range field {
+		if i == 0 {
+			if !(r == '_' || unicode.IsLetter(r)) {
+				return false
+			}
+		} else if !(r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)) {
+			return false
+		}
+	}
+	return true
+}
+
+func formatFieldExpr(field string) string {
+	field = strings.TrimSpace(field)
+	if field == "" {
+		return ""
+	}
+	if isSimpleIdentifier(field) {
+		return fmt.Sprintf("`%s`", field)
+	}
+	return field
+}
+
+func buildIndexKeys(c *Config) string {
+	parts := []string{fmt.Sprintf("%s VECTOR", formatFieldExpr(c.VectorField))}
+	for _, scalar := range c.ScalarFields {
+		expr := formatFieldExpr(scalar)
+		if expr != "" {
+			parts = append(parts, expr)
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func formatFieldExprList(fields []string) []string {
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		expr := formatFieldExpr(field)
+		if expr != "" {
+			out = append(out, expr)
+		}
+	}
+	return out
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // §7  Data loading  — Go goroutines for maximum parallel throughput
 //
@@ -556,11 +701,8 @@ func createIndex(cluster *gocb.Cluster, c *Config) (float64, error) {
 
 func loadData(cluster *gocb.Cluster, c *Config, opener *datasetOpener) error {
 	col := cluster.Bucket(c.Bucket).Scope(c.Scope).Collection(c.Collection)
-
-	type Doc struct {
-		Vec []float32 `json:"vec"`
-	}
 	type docItem struct {
+		idx int
 		id  string
 		vec []float32
 	}
@@ -607,7 +749,14 @@ func loadData(cluster *gocb.Cluster, c *Config, opener *datasetOpener) error {
 		}
 
 		for item := range jobs {
-			ops = append(ops, &gocb.UpsertOp{ID: item.id, Value: Doc{Vec: item.vec}})
+			doc := map[string]interface{}{c.VectorField: item.vec}
+			for k, v := range c.StaticFields {
+				doc[k] = v
+			}
+			if c.ScalarField != "" && c.ScalarModulo > 0 {
+				doc[c.ScalarField] = item.idx % c.ScalarModulo
+			}
+			ops = append(ops, &gocb.UpsertOp{ID: item.id, Value: doc})
 			if len(ops) >= batchSize {
 				flush()
 			}
@@ -622,6 +771,7 @@ func loadData(cluster *gocb.Cluster, c *Config, opener *datasetOpener) error {
 
 	enqueued, streamErr := streamFvecs(c.DataPath, opener, func(i int, vec []float32) error {
 		jobs <- docItem{
+			idx: i,
 			id:  fmt.Sprintf("%s-%d", c.DocIDPrefix, i),
 			vec: vec,
 		}
@@ -653,25 +803,30 @@ func buildQueryStmt(c *Config) string {
 	ks := fmt.Sprintf("`%s`.`%s`.`%s`", c.Bucket, c.Scope, c.Collection)
 
 	// Build APPROX_VECTOR_DISTANCE arguments
-	avd := fmt.Sprintf(`"%s"`, c.Similarity) // 3rd arg: similarity
-	if c.IndexType == "hyperscale" {
-		avd += fmt.Sprintf(", %d", c.NProbes) // 4th: nProbes
-		if c.Reranking {
-			avd += ", TRUE" // 5th: reranking
-			if c.TopNScan > 0 {
-				avd += fmt.Sprintf(", %d", c.TopNScan) // 6th: topNScan (plain int)
-			}
-		} else {
-			avd += ", FALSE"
+	avd := fmt.Sprintf(`"%s", %d`, c.Similarity, c.NProbes) // similarity, nProbes
+	if c.Reranking {
+		avd += ", TRUE"
+		if isHyperscaleIndexType(c.IndexType) && c.TopNScan > 0 {
+			avd += fmt.Sprintf(", %d", c.TopNScan) // topNScan is hyperscale-only
 		}
+	} else {
+		avd += ", FALSE"
 	}
 
-	return fmt.Sprintf(
-		"SELECT META(b).id FROM %s AS b"+
-			" ORDER BY APPROX_VECTOR_DISTANCE(b.`%s`, $vec, %s)"+
-			" LIMIT %d",
-		ks, c.VectorField, avd, c.TopK,
+	stmt := fmt.Sprintf(
+		"SELECT META(b).id FROM %s AS b",
+		ks,
 	)
+	if strings.TrimSpace(c.WhereClause) != "" {
+		stmt += " WHERE " + c.WhereClause
+	}
+	stmt += fmt.Sprintf(
+		" ORDER BY APPROX_VECTOR_DISTANCE(%s, $vec, %s) LIMIT %d",
+		fmt.Sprintf("b.%s", formatFieldExpr(c.VectorField)),
+		avd,
+		c.TopK,
+	)
+	return stmt
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -711,10 +866,17 @@ func runPhase(cluster *gocb.Cluster, c *Config, stmt string, queryVecs [][]float
 			qIdx := rng.Intn(n)
 
 			start := time.Now()
+			namedParams := map[string]interface{}{"vec": queryVecs[qIdx]}
+			for k, v := range c.NamedParams {
+				if strings.EqualFold(k, "vec") {
+					continue
+				}
+				namedParams[k] = v
+			}
 			rows, err := cluster.Query(stmt, &gocb.QueryOptions{
 				Adhoc:           true,
 				Timeout:         c.QueryTimeout,
-				NamedParameters: map[string]interface{}{"vec": queryVecs[qIdx]},
+				NamedParameters: namedParams,
 			})
 			lat := time.Since(start)
 
@@ -846,16 +1008,25 @@ func main() {
 	}
 
 	// Step 3: Define all flags with INI values as defaults, then parse
-	parseFlags(c)
+	dropIndexOnly := parseFlags(c)
 
 	log.Printf("index=%s  nprobes=%d  reranking=%v  topNScan=%d  workers=%d",
 		c.Description, c.NProbes, c.Reranking, c.TopNScan, c.Workers)
+	log.Printf("index_type=%s  vector_field=%s  scalar_fields=%v  include_fields=%v",
+		c.IndexType, c.VectorField, c.ScalarFields, c.IncludeFields)
 	opener := newDatasetOpener(c)
 
 	// Step 4: Connect to Couchbase
 	cluster, err := connectCB(c)
 	if err != nil {
 		log.Fatalf("Connection failed: %v", err)
+	}
+	if dropIndexOnly {
+		if err := dropIndex(cluster, c); err != nil {
+			log.Fatalf("Drop index failed: %v", err)
+		}
+		log.Printf("Drop index complete.")
+		return
 	}
 
 	// Step 5: Load data (parallel goroutines — no Python GIL limitation here)
@@ -893,6 +1064,9 @@ func main() {
 	groundTruth = groundTruth[:n]
 
 	stmt := buildQueryStmt(c)
+	if len(c.ScalarFields) > 0 && strings.TrimSpace(c.WhereClause) == "" {
+		log.Printf("Warning: scalar partition fields are configured (%v) but query.where_clause is empty; query may scan a much larger search space.", c.ScalarFields)
+	}
 	log.Printf("Query statement: %s", stmt)
 
 	// Step 8: Warmup phase (parallel goroutines — metrics discarded)

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -25,6 +26,15 @@ JOBS_ROOT = REPO_ROOT / "job_runs"
 JOBS_ROOT.mkdir(exist_ok=True)
 
 app = FastAPI(title="VIA Benchmark Job Server", version="0.1.0")
+
+# Allow CORS from any origin for now (can be restricted later)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 jobs_lock = threading.Lock()
 jobs: dict[str, dict[str, Any]] = {}
@@ -35,9 +45,14 @@ ALLOWED_OVERRIDE_SECTIONS = {
     "connection",
     "dataset",
     "s3",
+    "index",
+    "index_creation",
+    "query",
+    "output",
     "optuna",
     "index_params",
     "query_params",
+    "tuner_output",
     "loading",
     "benchmark",
 }

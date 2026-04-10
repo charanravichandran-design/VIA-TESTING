@@ -154,6 +154,36 @@ def call_go_benchmark(go_binary: str, config_path: str, params: dict) -> tuple[d
         return {}, False
 
 
+def drop_index_with_go(go_binary: str, config_path: str) -> bool:
+    cmd = [go_binary, "--config", config_path, "--drop-index-only=true"]
+    log.info(f"  → {' '.join(cmd)}")
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("  Drop-index command timed out (>10m).")
+        return False
+    except Exception as exc:
+        log.warning(f"  Drop-index command failed: {exc}")
+        return False
+
+    for line in proc.stderr.splitlines():
+        line = line.strip()
+        if line:
+            log.info(f"    [go-drop] {line}")
+
+    if proc.returncode != 0:
+        log.warning(f"  Drop-index exited with code {proc.returncode}")
+        return False
+
+    return True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # §3  Pareto front computation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -250,10 +280,8 @@ def main() -> None:
     base_skip_load  = cfg.getboolean("loading", "skip_load", fallback=False)
     base_skip_index = cfg.getboolean("loading", "skip_index", fallback=False)
 
-    # index_cache tracks which index configs are already built on the cluster.
-    # When the same nlist/train_list/quantization/persist combo is requested
-    # again, we set skip-index=true so the Go binary reuses the existing index.
-    index_cache: dict = {}
+    # We explicitly drop the index at the end of every outer trial, so
+    # cross-trial index reuse is disabled.
     all_trials:  list = []
     data_loaded = base_skip_load
 
@@ -287,16 +315,14 @@ def main() -> None:
         quantization        = trial.suggest_categorical("quantization",        quant_choices)
         persist_full_vector = trial.suggest_categorical("persist_full_vector", persist_choices)
 
-        # Cache key = hash of all 4 index build params
-        cache_key  = f"{nlist}_{train_list}_{quantization}_{persist_full_vector}"
-        cache_hit  = cache_key in index_cache
-        skip_index = base_skip_index or cache_hit   # reuse if already built
+        skip_index = base_skip_index
         index_built = skip_index
+        built_this_outer = False
 
         log.info(f"\n{'='*60}")
         log.info(f"OUTER trial {trial.number + 1}/{n_index_trials}")
         log.info(f"  nlist={nlist}  train={train_list}  quant={quantization}  persist={persist_full_vector}")
-        log.info(f"  Index: {'REUSE (cache hit)' if skip_index else 'BUILD (cache miss)'}")
+        log.info(f"  Index: {'REUSE (skip_index=true)' if skip_index else 'BUILD'}")
 
         # ── Inner Optuna study  (query-time parameters) ───────────────────────
         #
@@ -311,7 +337,7 @@ def main() -> None:
         inner_results: list = []
 
         def inner_objective(inner_trial: optuna.Trial) -> tuple:
-            nonlocal data_loaded, index_built
+            nonlocal data_loaded, index_built, built_this_outer
             # Cap nprobes to nlist — critical constraint
             np_max   = min(nprobes_max, nlist)
             nprobes  = inner_trial.suggest_int("nprobes", nprobes_min, np_max, step=nprobes_step)
@@ -359,6 +385,7 @@ def main() -> None:
                     data_loaded = True
                 if not skip_index_flag:
                     index_built = True
+                    built_this_outer = True
 
             if not metrics:
                 # Penalise failed trials heavily so Optuna deprioritises them
@@ -404,9 +431,9 @@ def main() -> None:
 
         inner_study.optimize(inner_objective, n_trials=n_query_trials)
 
-        # Mark this index config as built — subsequent outer trials with the
-        # same params will reuse it instead of rebuilding.
-        index_cache[cache_key] = True
+        if built_this_outer:
+            log.info("  Dropping index after outer trial completion ...")
+            drop_index_with_go(args.go_binary, args.config)
 
         # Return the best values from the inner study back to the outer study.
         # This is how the outer study learns which index configs are promising.
