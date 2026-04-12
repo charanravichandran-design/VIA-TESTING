@@ -587,14 +587,15 @@ func createIndex(cluster *gocb.Cluster, c *Config) (float64, error) {
 	default:
 		return 0, fmt.Errorf("unsupported index_type %q (supported: hyperscale, composite)", c.IndexType)
 	}
-	if whereClause != "" {
-		ddl += fmt.Sprintf("\n  WHERE %s", whereClause)
-	}
 	if len(includeKeys) > 0 && isHyperscale {
 		ddl += fmt.Sprintf("\n  INCLUDE (%s)", strings.Join(includeKeys, ", "))
 	} else if len(includeKeys) > 0 {
 		log.Printf("Ignoring include_fields for index_type=%s (INCLUDE is hyperscale-only).", c.IndexType)
 	}
+	if whereClause != "" {
+		ddl += fmt.Sprintf("\n  WHERE %s", whereClause)
+	}
+
 	ddl += fmt.Sprintf("\n  WITH %s", with)
 	log.Printf("Creating index:\n%s", ddl)
 
@@ -809,11 +810,12 @@ func buildQueryStmt(c *Config) string {
 	avd := fmt.Sprintf(`"%s", %d`, c.Similarity, c.NProbes) // similarity, nProbes
 	if c.Reranking {
 		avd += ", TRUE"
-		if isHyperscaleIndexType(c.IndexType) && c.TopNScan > 0 {
-			avd += fmt.Sprintf(", %d", c.TopNScan) // topNScan is hyperscale-only
-		}
 	} else {
 		avd += ", FALSE"
+	}
+
+	if isHyperscaleIndexType(c.IndexType) && c.TopNScan > 0 {
+		avd += fmt.Sprintf(", %d", c.TopNScan) // topNScan is hyperscale-only
 	}
 
 	stmt := fmt.Sprintf(

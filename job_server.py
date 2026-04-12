@@ -342,44 +342,70 @@ def job_log_page(job_id: str) -> str:
     <pre id="logs"></pre>
   </div>
   <script>
-    const jobId = {json.dumps(job_id)};
-    const logEl = document.getElementById('logs');
-    const statusEl = document.getElementById('status');
+        const jobId = {json.dumps(job_id)};
+        const logEl = document.getElementById('logs');
+        const statusEl = document.getElementById('status');
+        const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
 
-    async function refreshStatus() {{
-      const r = await fetch(`/jobs/${{jobId}}`);
-      const j = await r.json();
-      statusEl.textContent = j.status;
-    }}
-
-    function appendLine(line) {{
-      logEl.textContent += line + "\\n";
-      window.scrollTo(0, document.body.scrollHeight);
-    }}
-
-    async function loadInitial() {{
-      const r = await fetch(`/jobs/${{jobId}}/logs?limit=300`);
-      const j = await r.json();
-      statusEl.textContent = j.status;
-      for (const line of j.lines) appendLine(line);
-    }}
-
-    async function main() {{
-      await loadInitial();
-      const es = new EventSource(`/jobs/${{jobId}}/logs/stream`);
-      es.addEventListener('log', (ev) => appendLine(ev.data));
-      es.addEventListener('status', (ev) => {{
-        statusEl.textContent = ev.data;
-        if (ev.data === 'completed' || ev.data === 'failed' || ev.data === 'cancelled') {{
-          es.close();
+        function setStatus(s) {{
+            statusEl.textContent = s;
         }}
-      }});
-      es.onerror = () => {{
-        setTimeout(() => window.location.reload(), 3000);
-      }};
-      setInterval(refreshStatus, 3000);
-    }}
-    main();
+
+        function appendLine(line) {{
+            logEl.textContent += line + "\\n";
+            window.scrollTo(0, document.body.scrollHeight);
+        }}
+
+        async function loadInitial() {{
+            const r = await fetch(`/jobs/${{jobId}}/logs?limit=300`);
+            const j = await r.json();
+            setStatus(j.status);
+            for (const line of j.lines) appendLine(line);
+            return j.status;
+        }}
+
+        function openSSE() {{
+            const es = new EventSource(`/jobs/${{jobId}}/logs/stream`);
+
+            es.addEventListener('log', (ev) => appendLine(ev.data));
+
+            es.addEventListener('status', (ev) => {{
+                setStatus(ev.data);
+                if (TERMINAL.has(ev.data)) {{
+                    es.close();
+                }}
+            }});
+
+            // Only reload if the job is still active — a terminal job closing the
+            // SSE connection is expected; do not trigger a reload loop for it.
+            es.onerror = () => {{
+                if (TERMINAL.has(statusEl.textContent)) {{
+                    es.close();
+                    return;
+                }}
+                // Transient error on a live job: let EventSource auto-reconnect (it
+                // does so by default). Only force a full reload after 10 s of silence.
+                clearTimeout(openSSE._reloadTimer);
+                openSSE._reloadTimer = setTimeout(() => {{
+                    if (!TERMINAL.has(statusEl.textContent)) window.location.reload();
+                }}, 10000);
+            }};
+
+            es.onopen = () => clearTimeout(openSSE._reloadTimer);
+        }}
+        openSSE._reloadTimer = null;
+
+        async function main() {{
+            const initialStatus = await loadInitial();
+
+            if (TERMINAL.has(initialStatus)) {{
+                // Job already finished — no need for SSE, nothing will be pushed.
+                return;
+            }}
+
+            openSSE();
+        }}
+        main();
   </script>
 </body>
 </html>"""
@@ -457,27 +483,46 @@ def get_job_logs(job_id: str, limit: int = Query(default=200, ge=1, le=5000)) ->
 
 @app.get("/jobs/{job_id}/logs/stream")
 async def stream_job_logs(job_id: str, request: Request) -> StreamingResponse:
-    get_job_or_404(job_id)
-    q = subscribe_logs(job_id)
+    job = get_job_or_404(job_id)
+    client_addr = None
+    try:
+        client = request.client
+        client_addr = f"{client.host}:{client.port}" if client is not None else None
+    except Exception:
+        client_addr = None
+
+    print(f"[SSE] connection attempt for {job_id} from {client_addr}")
 
     async def event_generator():
+        # Always send current status immediately so the client knows the starting state.
+        yield sse_event("status", job["status"])
         yield "retry: 2000\n\n"
+
+        # If the job is already finished there is nothing left to stream.
+        if job["status"] in TERMINAL_JOB_STATES:
+            print(f"[SSE] {job_id} already terminal ({job['status']}), not subscribing")
+            return
+
+        q = subscribe_logs(job_id)
+        print(f"[SSE] subscribed {job_id} -> queue, client={client_addr}")
         try:
             while True:
                 if await request.is_disconnected():
+                    print(f"[SSE] client disconnected (is_disconnected) for {job_id} from {client_addr}")
                     break
 
                 try:
                     line = await asyncio.to_thread(q.get, True, 1.0)
                     yield sse_event("log", line)
                 except queue.Empty:
-                    job = get_job_or_404(job_id)
-                    if job["status"] in TERMINAL_JOB_STATES:
-                        yield sse_event("status", job["status"])
+                    current = get_job_or_404(job_id)
+                    if current["status"] in TERMINAL_JOB_STATES:
+                        yield sse_event("status", current["status"])
                         break
                     yield ": keep-alive\n\n"
         finally:
             unsubscribe_logs(job_id, q)
+            print(f"[SSE] unsubscribed {job_id} -> queue, client={client_addr}")
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
