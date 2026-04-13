@@ -55,6 +55,7 @@ ALLOWED_OVERRIDE_SECTIONS = {
     "tuner_output",
     "loading",
     "benchmark",
+    "results_s3",
 }
 FORBIDDEN_OPTUNA_KEYS = {"n_index_trials", "n_query_trials"}
 TERMINAL_JOB_STATES = {"completed", "failed", "cancelled"}
@@ -118,6 +119,42 @@ def resolve_path(path_str: str) -> Path:
     if p.is_absolute():
         return p
     return (REPO_ROOT / p).resolve()
+
+
+def interpreter_has_module(python_executable: str, module_name: str) -> bool:
+    try:
+        res = subprocess.run(
+            [python_executable, "-c", f"import {module_name}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def is_results_s3_enabled(config_path: Path) -> bool:
+    cfg = configparser.ConfigParser()
+    if not cfg.read(config_path):
+        return False
+    return cfg.getboolean("results_s3", "enabled", fallback=False)
+
+
+def resolve_python_executable(request: "JobCreateRequest", config_path: Path) -> str:
+    explicit_python = "python_executable" in request.model_fields_set
+    chosen = request.python_executable
+    if explicit_python:
+        return chosen
+
+    if is_results_s3_enabled(config_path) and not interpreter_has_module(chosen, "boto3"):
+        venv_python = REPO_ROOT / ".venv" / "bin" / "python"
+        if venv_python.exists():
+            venv_python_str = str(venv_python)
+            if interpreter_has_module(venv_python_str, "boto3"):
+                return venv_python_str
+    return chosen
 
 
 def read_tail(log_path: Path, limit: int) -> list[str]:
@@ -212,10 +249,10 @@ def prepare_job_config(job_dir: Path, request: JobCreateRequest) -> tuple[Path, 
     return generated, artifacts
 
 
-def build_command(request: JobCreateRequest, config_path: Path) -> list[str]:
+def build_command(request: JobCreateRequest, config_path: Path, python_executable: str) -> list[str]:
     go_binary = str(resolve_path(request.go_binary))
     cmd = [
-        request.python_executable,
+        python_executable,
         "-u",
         str(REPO_ROOT / "optuna_tuner.py"),
         "--config",
@@ -420,7 +457,8 @@ def create_job(request: JobCreateRequest) -> dict[str, Any]:
     try:
         validate_request_payload(request)
         config_path, artifacts = prepare_job_config(job_dir, request)
-        cmd = build_command(request, config_path)
+        python_executable = resolve_python_executable(request, config_path)
+        cmd = build_command(request, config_path, python_executable)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -428,6 +466,7 @@ def create_job(request: JobCreateRequest) -> dict[str, Any]:
     job_record = {
         "job_id": job_id,
         "label": request.label,
+        "python_executable": cmd[0],
         "status": "queued",
         "created_at": utc_now(),
         "started_at": None,
@@ -451,6 +490,7 @@ def create_job(request: JobCreateRequest) -> dict[str, Any]:
     return {
         "job_id": job_id,
         "status": "queued",
+        "python_executable": cmd[0],
         "job_dir": str(job_dir),
         "log_path": str(log_path),
         "config_path": str(config_path),

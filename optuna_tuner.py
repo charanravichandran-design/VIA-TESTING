@@ -185,6 +185,62 @@ def drop_index_with_go(go_binary: str, config_path: str) -> bool:
     return True
 
 
+def upload_results_to_s3(cfg: configparser.ConfigParser, artifact_paths: list[str]) -> dict[str, str]:
+    if not cfg.getboolean("results_s3", "enabled", fallback=False):
+        return {}
+
+    bucket = cfg.get("results_s3", "bucket", fallback="").strip()
+    if not bucket:
+        raise RuntimeError("[results_s3].enabled=true but [results_s3].bucket is empty")
+
+    prefix = cfg.get("results_s3", "prefix", fallback="").strip().strip("/")
+    region = cfg.get("results_s3", "region", fallback="").strip()
+    profile = cfg.get("results_s3", "profile", fallback="").strip()
+    endpoint = cfg.get("results_s3", "endpoint", fallback="").strip()
+    access_key = cfg.get("results_s3", "access_key_id", fallback="").strip()
+    secret_key = cfg.get("results_s3", "secret_access_key", fallback="").strip()
+    session_token = cfg.get("results_s3", "session_token", fallback="").strip()
+    use_path_style = cfg.getboolean("results_s3", "use_path_style", fallback=False)
+
+    try:
+        import boto3
+        from botocore.config import Config as BotoConfig
+    except Exception as exc:
+        raise RuntimeError("results_s3 upload requested but boto3 is not installed") from exc
+
+    session_kwargs = {}
+    if profile:
+        session_kwargs["profile_name"] = profile
+    session = boto3.session.Session(**session_kwargs)
+
+    client_kwargs = {}
+    if region:
+        client_kwargs["region_name"] = region
+    if endpoint:
+        client_kwargs["endpoint_url"] = endpoint
+    if use_path_style:
+        client_kwargs["config"] = BotoConfig(s3={"addressing_style": "path"})
+    if access_key and secret_key:
+        client_kwargs["aws_access_key_id"] = access_key
+        client_kwargs["aws_secret_access_key"] = secret_key
+        if session_token:
+            client_kwargs["aws_session_token"] = session_token
+
+    s3 = session.client("s3", **client_kwargs)
+    uploads: dict[str, str] = {}
+
+    for raw_path in artifact_paths:
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        key = f"{prefix}/{path.name}" if prefix else path.name
+        log.info(f"Uploading artifact to s3://{bucket}/{key}")
+        s3.upload_file(str(path), bucket, key)
+        uploads[str(path)] = f"s3://{bucket}/{key}"
+
+    return uploads
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # §3  Pareto front computation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -285,6 +341,8 @@ def main() -> None:
     trial_log      = cfg.get("tuner_output", "trial_log",      fallback="trial_results.jsonl")
     pareto_report  = cfg.get("tuner_output", "pareto_report",  fallback="pareto_report.json")
     optuna_storage = cfg.get("tuner_output", "optuna_storage", fallback="optuna_study.db")
+    index_cache_path = cfg.get("tuner_output", "index_cache", fallback="index_cache.json")
+    output_json = cfg.get("output", "output_json", fallback="results.json")
 
     # ── Shared state ──────────────────────────────────────────────────────────
     base_skip_load  = cfg.getboolean("loading", "skip_load", fallback=False)
@@ -569,6 +627,16 @@ def main() -> None:
         "all_trials":        all_trials,
     }
     Path(pareto_report).write_text(json.dumps(report, indent=2))
+
+    uploads: dict[str, str] = {}
+    artifacts_to_upload = [trial_log, pareto_report, optuna_storage, index_cache_path, output_json]
+    try:
+        uploads = upload_results_to_s3(cfg, artifacts_to_upload)
+    except Exception as exc:
+        log.warning(f"S3 upload failed: {exc}")
+    if uploads:
+        report["s3_uploads"] = uploads
+        Path(pareto_report).write_text(json.dumps(report, indent=2))
 
     # ── Print summary ─────────────────────────────────────────────────────────
     log.info("\n" + "=" * 60)
