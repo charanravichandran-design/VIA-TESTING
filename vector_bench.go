@@ -44,6 +44,8 @@ type Config struct {
 	QueryVectorsPath string
 	GroundTruthPath  string
 	DataPath         string
+	ScalarFieldsPath string
+	QueryFiltersPath string
 
 	// [s3] (optional, used when dataset paths are s3:// URIs)
 	S3Region          string
@@ -113,6 +115,8 @@ func loadConfig(path string) (*Config, error) {
 	c.QueryVectorsPath = ds.Key("query_vectors_path").String()
 	c.GroundTruthPath = ds.Key("ground_truth_path").String()
 	c.DataPath = ds.Key("data_path").String()
+	c.ScalarFieldsPath = ds.Key("scalar_fields_path").MustString("")
+	c.QueryFiltersPath = ds.Key("query_filters_path").MustString("")
 
 	s3 := f.Section("s3")
 	c.S3Region = s3.Key("region").MustString("")
@@ -192,6 +196,23 @@ func parseWhereClauseJSON(raw string) (string, error) {
 		return "", err
 	}
 	return sql, nil
+}
+
+func loadJSONObjects(path string, opener *datasetOpener, label string) ([]map[string]interface{}, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, nil
+	}
+	rc, err := opener.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open %s at %s: %w", label, path, err)
+	}
+	defer rc.Close()
+
+	var out []map[string]interface{}
+	if err := json.NewDecoder(rc).Decode(&out); err != nil {
+		return nil, fmt.Errorf("failed to decode %s JSON array at %s: %w", label, path, err)
+	}
+	return out, nil
 }
 
 func buildWhereExpr(v interface{}) (string, error) {
@@ -760,11 +781,12 @@ func formatFieldExprList(fields []string) []string {
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
-func loadData(cluster *gocb.Cluster, c *Config, opener *datasetOpener) error {
+func loadData(cluster *gocb.Cluster, c *Config, opener *datasetOpener, scalarRows []map[string]interface{}) error {
 	col := cluster.Bucket(c.Bucket).Scope(c.Scope).Collection(c.Collection)
 	type docItem struct {
 		id  string
 		vec []float32
+		row map[string]interface{}
 	}
 
 	loadWorkers := c.LoadWorkers
@@ -810,6 +832,9 @@ func loadData(cluster *gocb.Cluster, c *Config, opener *datasetOpener) error {
 
 		for item := range jobs {
 			doc := map[string]interface{}{c.VectorField: item.vec}
+			for k, v := range item.row {
+				doc[k] = v
+			}
 			ops = append(ops, &gocb.UpsertOp{ID: item.id, Value: doc})
 			if len(ops) >= batchSize {
 				flush()
@@ -824,9 +849,17 @@ func loadData(cluster *gocb.Cluster, c *Config, opener *datasetOpener) error {
 	}
 
 	enqueued, streamErr := streamFvecs(c.DataPath, opener, func(i int, vec []float32) error {
+		row := map[string]interface{}{}
+		if len(scalarRows) > 0 {
+			if i >= len(scalarRows) {
+				return fmt.Errorf("scalar_fields_path has %d rows but dataset has more vectors (first missing row index=%d)", len(scalarRows), i)
+			}
+			row = scalarRows[i]
+		}
 		jobs <- docItem{
 			id:  fmt.Sprintf("%s-%d", c.DocIDPrefix, i),
 			vec: vec,
+			row: row,
 		}
 		if (i+1)%10000 == 0 {
 			log.Printf("  Enqueued %d documents ...", i+1)
@@ -852,7 +885,19 @@ func loadData(cluster *gocb.Cluster, c *Config, opener *datasetOpener) error {
 // §8  Query building
 // ─────────────────────────────────────────────────────────────────────────────
 
-func buildQueryStmt(c *Config) string {
+func combineWhereClauses(a, b string) string {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" {
+		return b
+	}
+	if b == "" {
+		return a
+	}
+	return fmt.Sprintf("(%s) AND (%s)", a, b)
+}
+
+func buildQueryStmt(c *Config, whereSQL string) string {
 	ks := fmt.Sprintf("`%s`.`%s`.`%s`", c.Bucket, c.Scope, c.Collection)
 
 	// Build APPROX_VECTOR_DISTANCE arguments
@@ -871,8 +916,8 @@ func buildQueryStmt(c *Config) string {
 		"SELECT META(b).id FROM %s AS b",
 		ks,
 	)
-	if strings.TrimSpace(c.WhereClauseSQL) != "" {
-		stmt += " WHERE " + c.WhereClauseSQL
+	if strings.TrimSpace(whereSQL) != "" {
+		stmt += " WHERE " + whereSQL
 	}
 	stmt += fmt.Sprintf(
 		" ORDER BY APPROX_VECTOR_DISTANCE(%s, $vec, %s) LIMIT %d",
@@ -901,7 +946,7 @@ type queryResult struct {
 	latency  time.Duration // end-to-end query latency
 }
 
-func runPhase(cluster *gocb.Cluster, c *Config, stmt string, queryVecs [][]float32, durationSec int) []queryResult {
+func runPhase(cluster *gocb.Cluster, c *Config, queryStmts []string, queryVecs [][]float32, durationSec int) []queryResult {
 	var (
 		results []queryResult
 		mu      sync.Mutex
@@ -918,6 +963,10 @@ func runPhase(cluster *gocb.Cluster, c *Config, stmt string, queryVecs [][]float
 
 		for atomic.LoadInt32(&stop) == 0 {
 			qIdx := rng.Intn(n)
+			stmt := queryStmts[0]
+			if len(queryStmts) == n {
+				stmt = queryStmts[qIdx]
+			}
 
 			start := time.Now()
 			rows, err := cluster.Query(stmt, &gocb.QueryOptions{
@@ -1063,6 +1112,21 @@ func main() {
 		c.IndexType, c.VectorField, c.ScalarFields, c.IncludeFields)
 	opener := newDatasetOpener(c)
 
+	scalarRows, err := loadJSONObjects(c.ScalarFieldsPath, opener, "scalar_fields")
+	if err != nil {
+		log.Fatalf("Failed to load scalar fields: %v", err)
+	}
+	queryFilters, err := loadJSONObjects(c.QueryFiltersPath, opener, "query_filters")
+	if err != nil {
+		log.Fatalf("Failed to load query filters: %v", err)
+	}
+	if len(scalarRows) > 0 {
+		log.Printf("Loaded %d scalar field rows from %s", len(scalarRows), c.ScalarFieldsPath)
+	}
+	if len(queryFilters) > 0 {
+		log.Printf("Loaded %d query filter rows from %s", len(queryFilters), c.QueryFiltersPath)
+	}
+
 	// Step 4: Connect to Couchbase
 	cluster, err := connectCB(c)
 	if err != nil {
@@ -1079,7 +1143,7 @@ func main() {
 	// Step 5: Load data (parallel goroutines — no Python GIL limitation here)
 	if !c.SkipLoad {
 		log.Printf("Loading base vectors from %s ...", c.DataPath)
-		if err := loadData(cluster, c, opener); err != nil {
+		if err := loadData(cluster, c, opener, scalarRows); err != nil {
 			log.Fatalf("Failed to load base vectors: %v", err)
 		}
 	}
@@ -1107,26 +1171,45 @@ func main() {
 	if len(groundTruth) < n {
 		n = len(groundTruth)
 	}
+	if len(queryFilters) > 0 {
+		if len(queryFilters) < n {
+			log.Fatalf("query_filters_path has %d rows but requires at least %d rows (one per query vector)", len(queryFilters), n)
+		}
+	}
 	queryVecs = queryVecs[:n]
 	groundTruth = groundTruth[:n]
+	if len(queryFilters) > 0 {
+		queryFilters = queryFilters[:n]
+	}
 
-	stmt := buildQueryStmt(c)
+	queryStmts := []string{buildQueryStmt(c, c.WhereClauseSQL)}
+	if len(queryFilters) > 0 {
+		queryStmts = make([]string, n)
+		for i := 0; i < n; i++ {
+			filterSQL, err := buildWhereExpr(queryFilters[i])
+			if err != nil {
+				log.Fatalf("Invalid query filter at index %d: %v", i, err)
+			}
+			whereSQL := combineWhereClauses(c.WhereClauseSQL, filterSQL)
+			queryStmts[i] = buildQueryStmt(c, whereSQL)
+		}
+	}
 	if len(c.ScalarFields) > 0 && strings.TrimSpace(c.WhereClauseSQL) == "" {
 		log.Printf("Warning: scalar partition fields are configured (%v) but query.where_clause is empty; query may scan a much larger search space.", c.ScalarFields)
 	}
-	log.Printf("Query statement: %s", stmt)
+	log.Printf("Query statement (sample): %s", queryStmts[0])
 
 	// Step 8: Warmup phase (parallel goroutines — metrics discarded)
 	if c.Warmup > 0 {
 		log.Printf("Warming up for %ds (%d workers) ...", c.Warmup, c.Workers)
-		runPhase(cluster, c, stmt, queryVecs, c.Warmup)
+		runPhase(cluster, c, queryStmts, queryVecs, c.Warmup)
 		log.Printf("Warmup complete.")
 	}
 
 	// Step 9: Measurement phase (parallel goroutines — closed-loop)
 	log.Printf("Measuring for %ds (%d workers) ...", c.Duration, c.Workers)
 	wallStart := time.Now()
-	results := runPhase(cluster, c, stmt, queryVecs, c.Duration)
+	results := runPhase(cluster, c, queryStmts, queryVecs, c.Duration)
 	wallSecs := time.Since(wallStart).Seconds()
 	log.Printf("Measurement complete: %d queries in %.1fs", len(results), wallSecs)
 
