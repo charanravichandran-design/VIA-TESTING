@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 REPO_ROOT = Path(__file__).resolve().parent
 JOBS_ROOT = REPO_ROOT / "job_runs"
 JOBS_ROOT.mkdir(exist_ok=True)
+DEFAULT_CONFIG_TEMPLATE = REPO_ROOT / "config.ini"
 
 app = FastAPI(title="VIA Benchmark Job Server", version="0.1.0")
 
@@ -57,7 +58,6 @@ ALLOWED_OVERRIDE_SECTIONS = {
     "benchmark",
     "results_s3",
 }
-FORBIDDEN_OPTUNA_KEYS = {"n_index_trials", "n_query_trials"}
 TERMINAL_JOB_STATES = {"completed", "failed", "cancelled"}
 
 
@@ -109,6 +109,8 @@ def to_ini_value(value: Any) -> str:
         return "true" if value else "false"
     if value is None:
         return ""
+    if isinstance(value, dict):
+        return json.dumps(value)
     if isinstance(value, list):
         return ", ".join(str(v) for v in value)
     return str(value)
@@ -135,26 +137,20 @@ def interpreter_has_module(python_executable: str, module_name: str) -> bool:
         return False
 
 
-def is_results_s3_enabled(config_path: Path) -> bool:
-    cfg = configparser.ConfigParser()
-    if not cfg.read(config_path):
-        return False
-    return cfg.getboolean("results_s3", "enabled", fallback=False)
+def choose_python_executable() -> str:
+    """Prefer the project's .venv/python if present, otherwise fall back to system Python."""
+    venv_python = REPO_ROOT / ".venv" / "bin" / "python"
+    if venv_python.exists() and os.access(str(venv_python), os.X_OK):
+        return str(venv_python)
+    return sys.executable
 
 
-def resolve_python_executable(request: "JobCreateRequest", config_path: Path) -> str:
-    explicit_python = "python_executable" in request.model_fields_set
-    chosen = request.python_executable
-    if explicit_python:
-        return chosen
-
-    if is_results_s3_enabled(config_path) and not interpreter_has_module(chosen, "boto3"):
-        venv_python = REPO_ROOT / ".venv" / "bin" / "python"
-        if venv_python.exists():
-            venv_python_str = str(venv_python)
-            if interpreter_has_module(venv_python_str, "boto3"):
-                return venv_python_str
-    return chosen
+def choose_go_binary() -> str:
+    """Use the repository-local vector_bench binary. Raise if missing."""
+    bin_path = REPO_ROOT / "vector_bench"
+    if not bin_path.exists():
+        raise FileNotFoundError(f"vector_bench binary not found at {bin_path}; build it with 'go build -o vector_bench .'")
+    return str(bin_path.resolve())
 
 
 def read_tail(log_path: Path, limit: int) -> list[str]:
@@ -168,7 +164,6 @@ def read_tail(log_path: Path, limit: int) -> list[str]:
 
 
 class JobCreateRequest(BaseModel):
-    config_template_path: str = "config.ini"
     config_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
     go_binary: str = "./vector_bench"
     python_executable: str = sys.executable
@@ -176,7 +171,6 @@ class JobCreateRequest(BaseModel):
     n_index_trials: Optional[int] = None
     n_query_trials: Optional[int] = None
     extra_args: list[str] = Field(default_factory=list)
-    label: Optional[str] = None
 
 
 def validate_request_payload(request: JobCreateRequest) -> None:
@@ -198,16 +192,6 @@ def validate_request_payload(request: JobCreateRequest) -> None:
         if not isinstance(values, dict):
             raise ValueError(f"config_overrides.{section} must be an object/dict")
 
-    optuna_overrides = request.config_overrides.get("optuna", {})
-    duplicate_keys = sorted(FORBIDDEN_OPTUNA_KEYS.intersection(optuna_overrides.keys()))
-    if duplicate_keys:
-        raise ValueError(
-            "Do not set "
-            + ", ".join(f"optuna.{k}" for k in duplicate_keys)
-            + " in config_overrides. Use top-level n_index_trials / n_query_trials fields instead."
-        )
-
-
 def apply_overrides(cfg: configparser.ConfigParser, overrides: dict[str, dict[str, Any]]) -> None:
     for section, values in overrides.items():
         if not cfg.has_section(section):
@@ -217,7 +201,7 @@ def apply_overrides(cfg: configparser.ConfigParser, overrides: dict[str, dict[st
 
 
 def prepare_job_config(job_dir: Path, request: JobCreateRequest) -> tuple[Path, dict[str, str]]:
-    template_path = resolve_path(request.config_template_path)
+    template_path = DEFAULT_CONFIG_TEMPLATE
     cfg = configparser.ConfigParser()
     if not cfg.read(template_path):
         raise ValueError(f"Cannot read config template: {template_path}")
@@ -230,6 +214,10 @@ def prepare_job_config(job_dir: Path, request: JobCreateRequest) -> tuple[Path, 
         "index_cache": str(job_dir / "index_cache.json"),
     }
 
+    apply_overrides(cfg, request.config_overrides)
+
+    # Always keep artifacts isolated under this job's directory, even if
+    # caller passes output/tuner_output overrides.
     if not cfg.has_section("output"):
         cfg.add_section("output")
     cfg.set("output", "output_json", artifacts["results_json"])
@@ -241,16 +229,13 @@ def prepare_job_config(job_dir: Path, request: JobCreateRequest) -> tuple[Path, 
     cfg.set("tuner_output", "optuna_storage", artifacts["optuna_storage"])
     cfg.set("tuner_output", "index_cache", artifacts["index_cache"])
 
-    apply_overrides(cfg, request.config_overrides)
-
     generated = job_dir / "config.generated.ini"
     with generated.open("w", encoding="utf-8") as f:
         cfg.write(f)
     return generated, artifacts
 
 
-def build_command(request: JobCreateRequest, config_path: Path, python_executable: str) -> list[str]:
-    go_binary = str(resolve_path(request.go_binary))
+def build_command(request: JobCreateRequest, config_path: Path, python_executable: str, go_binary: str) -> list[str]:
     cmd = [
         python_executable,
         "-u",
@@ -457,16 +442,18 @@ def create_job(request: JobCreateRequest) -> dict[str, Any]:
     try:
         validate_request_payload(request)
         config_path, artifacts = prepare_job_config(job_dir, request)
-        python_executable = resolve_python_executable(request, config_path)
-        cmd = build_command(request, config_path, python_executable)
+        python_executable = choose_python_executable()
+        try:
+            go_binary = choose_go_binary()
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        cmd = build_command(request, config_path, python_executable, go_binary)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     log_path = job_dir / "runner.log"
     job_record = {
         "job_id": job_id,
-        "label": request.label,
-        "python_executable": cmd[0],
         "status": "queued",
         "created_at": utc_now(),
         "started_at": None,
@@ -490,7 +477,6 @@ def create_job(request: JobCreateRequest) -> dict[str, Any]:
     return {
         "job_id": job_id,
         "status": "queued",
-        "python_executable": cmd[0],
         "job_dir": str(job_dir),
         "log_path": str(log_path),
         "config_path": str(config_path),

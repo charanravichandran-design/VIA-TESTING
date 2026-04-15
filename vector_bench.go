@@ -47,12 +47,9 @@ type Config struct {
 
 	// [s3] (optional, used when dataset paths are s3:// URIs)
 	S3Region          string
-	S3Profile         string
 	S3Endpoint        string
 	S3AccessKeyID     string
 	S3SecretAccessKey string
-	S3SessionToken    string
-	S3UsePathStyle    bool
 
 	// [index]
 	IndexType     string
@@ -72,12 +69,12 @@ type Config struct {
 	PersistFullVector bool
 
 	// [query]
-	TopK        int
-	NProbes     int
-	Reranking   bool
-	TopNScan    int
-	WhereClause string
-	NamedParams map[string]interface{}
+	TopK           int
+	NProbes        int
+	Reranking      bool
+	TopNScan       int
+	WhereClause    string
+	WhereClauseSQL string
 
 	// [benchmark]
 	Workers      int
@@ -86,14 +83,11 @@ type Config struct {
 	QueryTimeout time.Duration
 
 	// [loading]
-	SkipLoad     bool
-	SkipIndex    bool
-	BatchSize    int
-	LoadWorkers  int
-	DocIDPrefix  string
-	StaticFields map[string]interface{}
-	ScalarField  string
-	ScalarModulo int
+	SkipLoad    bool
+	SkipIndex   bool
+	BatchSize   int
+	LoadWorkers int
+	DocIDPrefix string
 
 	// [output]
 	OutputJSON string
@@ -122,12 +116,9 @@ func loadConfig(path string) (*Config, error) {
 
 	s3 := f.Section("s3")
 	c.S3Region = s3.Key("region").MustString("")
-	c.S3Profile = s3.Key("profile").MustString("")
 	c.S3Endpoint = s3.Key("endpoint").MustString("")
 	c.S3AccessKeyID = s3.Key("access_key_id").MustString("")
 	c.S3SecretAccessKey = s3.Key("secret_access_key").MustString("")
-	c.S3SessionToken = s3.Key("session_token").MustString("")
-	c.S3UsePathStyle = s3.Key("use_path_style").MustBool(false)
 
 	idx := f.Section("index")
 	c.IndexType = normalizeIndexType(idx.Key("index_type").MustString("hyperscale"))
@@ -152,13 +143,12 @@ func loadConfig(path string) (*Config, error) {
 	c.Reranking = q.Key("reranking").MustBool(false)
 	c.TopNScan = q.Key("top_n_scan").MustInt(0)
 	c.WhereClause = q.Key("where_clause").MustString("")
-	c.NamedParams = map[string]interface{}{}
-	if raw := q.Key("named_params_json").MustString(""); raw != "" {
-		params, err := parseJSONMap(raw)
+	if strings.TrimSpace(c.WhereClause) != "" {
+		whereSQL, err := parseWhereClauseJSON(c.WhereClause)
 		if err != nil {
-			return nil, fmt.Errorf("invalid [query].named_params_json: %w", err)
+			return nil, fmt.Errorf("invalid [query].where_clause JSON: %w", err)
 		}
-		c.NamedParams = params
+		c.WhereClauseSQL = whereSQL
 	}
 
 	b := f.Section("benchmark")
@@ -173,16 +163,6 @@ func loadConfig(path string) (*Config, error) {
 	c.BatchSize = l.Key("load_batch_size").MustInt(500)
 	c.LoadWorkers = l.Key("load_workers").MustInt(c.Workers)
 	c.DocIDPrefix = l.Key("doc_id_prefix").MustString("vec")
-	c.StaticFields = map[string]interface{}{}
-	if raw := l.Key("static_fields_json").MustString(""); raw != "" {
-		fields, err := parseJSONMap(raw)
-		if err != nil {
-			return nil, fmt.Errorf("invalid [loading].static_fields_json: %w", err)
-		}
-		c.StaticFields = fields
-	}
-	c.ScalarField = l.Key("scalar_field").MustString("")
-	c.ScalarModulo = l.Key("scalar_modulo").MustInt(0)
 
 	o := f.Section("output")
 	c.OutputJSON = o.Key("output_json").MustString("results.json")
@@ -200,6 +180,88 @@ func parseJSONMap(raw string) (map[string]interface{}, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+func parseWhereClauseJSON(raw string) (string, error) {
+	var payload interface{}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return "", err
+	}
+	sql, err := buildWhereExpr(payload)
+	if err != nil {
+		return "", err
+	}
+	return sql, nil
+}
+
+func buildWhereExpr(v interface{}) (string, error) {
+	obj, ok := v.(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("where clause must be a JSON object")
+	}
+
+	if andRaw, exists := obj["and"]; exists {
+		items, ok := andRaw.([]interface{})
+		if !ok || len(items) == 0 {
+			return "", fmt.Errorf("\"and\" must be a non-empty array")
+		}
+		parts := make([]string, 0, len(items))
+		for _, it := range items {
+			part, err := buildWhereExpr(it)
+			if err != nil {
+				return "", err
+			}
+			parts = append(parts, part)
+		}
+		return "(" + strings.Join(parts, " AND ") + ")", nil
+	}
+
+	if orRaw, exists := obj["or"]; exists {
+		items, ok := orRaw.([]interface{})
+		if !ok || len(items) == 0 {
+			return "", fmt.Errorf("\"or\" must be a non-empty array")
+		}
+		parts := make([]string, 0, len(items))
+		for _, it := range items {
+			part, err := buildWhereExpr(it)
+			if err != nil {
+				return "", err
+			}
+			parts = append(parts, part)
+		}
+		return "(" + strings.Join(parts, " OR ") + ")", nil
+	}
+
+	parts := make([]string, 0, len(obj))
+	for k, val := range obj {
+		parts = append(parts, fmt.Sprintf("b.%s = %s", formatFieldExpr(k), formatSQLLiteral(val)))
+	}
+	if len(parts) == 0 {
+		return "", nil
+	}
+	if len(parts) == 1 {
+		return parts[0], nil
+	}
+	return "(" + strings.Join(parts, " AND ") + ")", nil
+}
+
+func formatSQLLiteral(v interface{}) string {
+	switch x := v.(type) {
+	case nil:
+		return "NULL"
+	case string:
+		return "'" + strings.ReplaceAll(x, "'", "''") + "'"
+	case bool:
+		if x {
+			return "TRUE"
+		}
+		return "FALSE"
+	case float64:
+		return fmt.Sprintf("%v", x)
+	default:
+		b, _ := json.Marshal(x)
+		return "'" + strings.ReplaceAll(string(b), "'", "''") + "'"
+	}
 }
 
 func parseCSVList(raw string) []string {
@@ -355,8 +417,7 @@ func (o *datasetOpener) getS3Client() (*s3.S3, error) {
 	}
 
 	awsCfg := aws.NewConfig().
-		WithRegion(region).
-		WithS3ForcePathStyle(o.cfg.S3UsePathStyle)
+		WithRegion(region)
 	if o.cfg.S3Endpoint != "" {
 		awsCfg = awsCfg.WithEndpoint(o.cfg.S3Endpoint)
 	}
@@ -364,7 +425,7 @@ func (o *datasetOpener) getS3Client() (*s3.S3, error) {
 		awsCfg = awsCfg.WithCredentials(credentials.NewStaticCredentials(
 			o.cfg.S3AccessKeyID,
 			o.cfg.S3SecretAccessKey,
-			o.cfg.S3SessionToken,
+			"",
 		))
 	}
 
@@ -372,10 +433,6 @@ func (o *datasetOpener) getS3Client() (*s3.S3, error) {
 		Config:            *awsCfg,
 		SharedConfigState: session.SharedConfigEnable,
 	}
-	if o.cfg.S3Profile != "" {
-		sessOpts.Profile = o.cfg.S3Profile
-	}
-
 	sess, err := session.NewSessionWithOptions(sessOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create AWS session: %w", err)
@@ -706,7 +763,6 @@ func formatFieldExprList(fields []string) []string {
 func loadData(cluster *gocb.Cluster, c *Config, opener *datasetOpener) error {
 	col := cluster.Bucket(c.Bucket).Scope(c.Scope).Collection(c.Collection)
 	type docItem struct {
-		idx int
 		id  string
 		vec []float32
 	}
@@ -754,12 +810,6 @@ func loadData(cluster *gocb.Cluster, c *Config, opener *datasetOpener) error {
 
 		for item := range jobs {
 			doc := map[string]interface{}{c.VectorField: item.vec}
-			for k, v := range c.StaticFields {
-				doc[k] = v
-			}
-			if c.ScalarField != "" && c.ScalarModulo > 0 {
-				doc[c.ScalarField] = item.idx % c.ScalarModulo
-			}
 			ops = append(ops, &gocb.UpsertOp{ID: item.id, Value: doc})
 			if len(ops) >= batchSize {
 				flush()
@@ -775,7 +825,6 @@ func loadData(cluster *gocb.Cluster, c *Config, opener *datasetOpener) error {
 
 	enqueued, streamErr := streamFvecs(c.DataPath, opener, func(i int, vec []float32) error {
 		jobs <- docItem{
-			idx: i,
 			id:  fmt.Sprintf("%s-%d", c.DocIDPrefix, i),
 			vec: vec,
 		}
@@ -822,8 +871,8 @@ func buildQueryStmt(c *Config) string {
 		"SELECT META(b).id FROM %s AS b",
 		ks,
 	)
-	if strings.TrimSpace(c.WhereClause) != "" {
-		stmt += " WHERE " + c.WhereClause
+	if strings.TrimSpace(c.WhereClauseSQL) != "" {
+		stmt += " WHERE " + c.WhereClauseSQL
 	}
 	stmt += fmt.Sprintf(
 		" ORDER BY APPROX_VECTOR_DISTANCE(%s, $vec, %s) LIMIT %d",
@@ -871,17 +920,10 @@ func runPhase(cluster *gocb.Cluster, c *Config, stmt string, queryVecs [][]float
 			qIdx := rng.Intn(n)
 
 			start := time.Now()
-			namedParams := map[string]interface{}{"vec": queryVecs[qIdx]}
-			for k, v := range c.NamedParams {
-				if strings.EqualFold(k, "vec") {
-					continue
-				}
-				namedParams[k] = v
-			}
 			rows, err := cluster.Query(stmt, &gocb.QueryOptions{
 				Adhoc:           true,
 				Timeout:         c.QueryTimeout,
-				NamedParameters: namedParams,
+				NamedParameters: map[string]interface{}{"vec": queryVecs[qIdx]},
 			})
 			lat := time.Since(start)
 
@@ -1069,7 +1111,7 @@ func main() {
 	groundTruth = groundTruth[:n]
 
 	stmt := buildQueryStmt(c)
-	if len(c.ScalarFields) > 0 && strings.TrimSpace(c.WhereClause) == "" {
+	if len(c.ScalarFields) > 0 && strings.TrimSpace(c.WhereClauseSQL) == "" {
 		log.Printf("Warning: scalar partition fields are configured (%v) but query.where_clause is empty; query may scan a much larger search space.", c.ScalarFields)
 	}
 	log.Printf("Query statement: %s", stmt)
