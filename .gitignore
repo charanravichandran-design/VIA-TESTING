@@ -55,3 +55,6 @@ job_runs/
 
 # MacOS
 .DS_Store
+
+# Configuration files with sensitive information
+config-example.ini
