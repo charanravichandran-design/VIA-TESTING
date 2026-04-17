@@ -289,6 +289,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args   = parse_args()
     cfg    = load_config(args.config)
+    index_type = cfg.get("index", "index_type", fallback="hyperscale").strip().lower()
+    is_hyperscale = index_type == "hyperscale"
 
     # ── Read Optuna study settings ────────────────────────────────────────────
     n_index_trials = args.n_index_trials or cfg.getint("optuna", "n_index_trials", fallback=5)
@@ -351,6 +353,7 @@ def main() -> None:
     log.info(f"Config          : {args.config}")
     log.info(f"Index trials    : {n_index_trials}")
     log.info(f"Query trials    : {n_query_trials}")
+    log.info(f"Index type      : {index_type}")
     log.info(f"Objectives      : {list(zip(objectives, directions))}")
     log.info("=" * 60)
 
@@ -486,7 +489,7 @@ def main() -> None:
                 "nprobes": seeded_nprobes,
                 "reranking": base_reranking if persist_full_vector else False,
             }
-            if seeded_inner["reranking"]:
+            if is_hyperscale:
                 seeded_inner["top_n_scan"] = max(tns_min, min(tns_max, base_top_n_scan))
             log.info(f"Seeding first inner trial from config [query]: {seeded_inner}")
             inner_study.enqueue_trial(seeded_inner)
@@ -505,10 +508,10 @@ def main() -> None:
                 if persist_full_vector else False
             )
 
-            # top_n_scan only makes sense when reranking=True
+            # top_n_scan is hyperscale-only and independent of reranking.
             top_n_scan = (
                 inner_trial.suggest_int("top_n_scan", tns_min, tns_max, step=effective_tns_step)
-                if reranking else 0
+                if is_hyperscale else 0
             )
 
             log.info(
